@@ -51,6 +51,37 @@ async function createOrder(req, res, next) {
       });
     }
 
+    // 检查是否有未支付的订单（防止重复支付）
+    // SQLite 不支持 $ne，需要查询所有订单然后过滤
+    const allOrders = await Order.find({ openid }).exec();
+    const unpaidOrders = allOrders.filter(order => order.status !== 'paid');
+    
+    if (unpaidOrders.length > 0) {
+      // 检查最近的未支付订单是否过期（超过30分钟）
+      const recentOrder = unpaidOrders.sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.created_at || 0).getTime();
+        const timeB = new Date(b.createdAt || b.created_at || 0).getTime();
+        return timeB - timeA; // 最新的在前
+      })[0];
+      
+      const orderAge = Date.now() - new Date(recentOrder.createdAt || recentOrder.created_at).getTime();
+      const thirtyMinutes = 30 * 60 * 1000;
+      
+      if (orderAge < thirtyMinutes) {
+        return res.status(400).json({
+          success: false,
+          message: '您有未完成的订单，请先完成支付或等待订单过期',
+          existingOrderId: recentOrder.orderId
+        });
+      } else {
+        // 订单已过期，可以创建新订单
+        logger.info('旧订单已过期，允许创建新订单', {
+          oldOrderId: recentOrder.orderId,
+          orderAge: Math.round(orderAge / 1000 / 60) + '分钟'
+        });
+      }
+    }
+
     // 处理优惠码
     let finalPrice = price;
     let discountAmount = 0;
@@ -281,16 +312,34 @@ async function paymentNotify(req, res, next) {
     }
 
     if (user) {
-      const expireTime = new Date();
-      expireTime.setDate(expireTime.getDate() + order.duration);
+      // 会员续期规则：
+      // - 如果用户当前仍在会员期内：从当前到期时间续期（避免“买一年反而变短”）
+      // - 如果已过期或是免费：从支付时间/当前时间开始计算
+      const durationDays = Number(order.duration) || 0;
+      const now = new Date();
+      const paidAt = order.paidTime ? new Date(order.paidTime) : now;
+      const currentExpire = user.membershipExpireTime ? new Date(user.membershipExpireTime) : null;
+
+      const baseTime =
+        user.membership === 'premium' &&
+        currentExpire &&
+        !isNaN(currentExpire.getTime()) &&
+        currentExpire > now
+          ? currentExpire
+          : paidAt;
+
+      const expireTime = new Date(baseTime);
+      expireTime.setDate(expireTime.getDate() + durationDays);
 
       user.membership = 'premium';
       user.membershipExpireTime = expireTime;
-      await user.save();
-      
+      await user.save(); // SQLite 模式下 save 已实现真正 UPDATE
+
       logger.info('用户会员状态已更新', {
         userId: user.id,
         openid: user.openid,
+        durationDays,
+        baseTime,
         expireTime
       });
     } else {
@@ -325,6 +374,7 @@ async function paymentNotify(req, res, next) {
 
 /**
  * 支付完成确认
+ * 修改重点：增加"兜底逻辑"，如果订单已支付，强制返回会员状态
  */
 async function completePayment(req, res, next) {
   try {
@@ -337,6 +387,7 @@ async function completePayment(req, res, next) {
       });
     }
 
+    // 1. 查订单 (这是最关键的凭证)
     const order = await Order.findOne({ orderId });
 
     if (!order) {
@@ -346,12 +397,108 @@ async function completePayment(req, res, next) {
       });
     }
 
-    res.json({
+    // 2. 查用户
+    let user = null;
+    if (order.userId) {
+      user = await User.findById(order.userId);
+    } else if (order.openid) {
+      user = await User.findOne({ openid: order.openid });
+    }
+
+    // 3. 构建会员状态 (核心修改都在这里)
+    let membershipStatus = null;
+    if (user) {
+      // 获取数据库中当前的会员信息
+      let currentMembership = user.membership || 'free';
+      let currentExpireTime = user.membershipExpireTime || null;
+
+      // -----------------------------------------------------------------
+      // ⭐ 关键修复：双重确认逻辑
+      // 如果 订单是已支付(paid) 状态，但 用户表还是免费(free) 或 过期
+      // -----------------------------------------------------------------
+      const isOrderPaid = order.status === 'paid';
+      const isUserFree = currentMembership !== 'premium';
+      
+      // 检查当前时间是否超过了数据库里的过期时间
+      const isExpiredInDb = currentExpireTime && new Date(currentExpireTime) < new Date();
+
+      if (isOrderPaid && (isUserFree || isExpiredInDb)) {
+        logger.warn('检测到数据同步延迟：订单已支付但用户状态未更新，正在修正返回数据', {
+          orderId: order.orderId,
+          userId: user.id || user._id
+        });
+
+        // ✅ 关键修复：这里不仅修正响应，还要把会员状态真正写回数据库
+        currentMembership = 'premium';
+
+        const paidTime = order.paidTime ? new Date(order.paidTime) : new Date();
+        const durationDays = Number(order.duration) || 365; // 默认值防错
+
+        const newExpireTime = new Date(paidTime);
+        newExpireTime.setDate(newExpireTime.getDate() + durationDays);
+
+        // 写回数据库（SQLite 模式下 save 已实现 UPDATE）
+        user.membership = 'premium';
+        user.membershipExpireTime = newExpireTime;
+        await user.save();
+
+        currentExpireTime = newExpireTime;
+      }
+
+      // -----------------------------------------------------------------
+      // 处理日期格式（SQLite 返回字符串，MongoDB 返回 Date）
+      let expireTimeForResponse = currentExpireTime;
+      if (expireTimeForResponse && typeof expireTimeForResponse === 'string') {
+        // SQLite 返回的字符串，保持字符串格式
+        expireTimeForResponse = expireTimeForResponse;
+      } else if (expireTimeForResponse && expireTimeForResponse.toISOString) {
+        // MongoDB 返回的 Date 对象，转换为 ISO 字符串
+        expireTimeForResponse = expireTimeForResponse.toISOString();
+      } else if (expireTimeForResponse instanceof Date) {
+        // 如果是新计算的 Date 对象，转换为 ISO 字符串
+        expireTimeForResponse = expireTimeForResponse.toISOString();
+      } else {
+        expireTimeForResponse = null;
+      }
+
+      membershipStatus = {
+        type: currentMembership === 'premium' ? 'premium' : 'free',
+        isPremium: currentMembership === 'premium',
+        expireTime: expireTimeForResponse
+      };
+
+      logger.info('completePayment 返回会员状态', {
+        orderId: order.orderId,
+        userId: user.id || user._id,
+        membershipStatus // 这里打印的一定要是修正后的状态
+      });
+    } else {
+      logger.warn('completePayment 未找到用户', {
+        orderId: order.orderId,
+        userId: order.userId,
+        openid: order.openid
+      });
+    }
+
+    // 4. 返回订单 + 会员信息
+    return res.json({
       success: true,
       data: {
         orderId: order.orderId,
         status: order.status,
-        paidTime: order.paidTime
+        paidTime: order.paidTime || null,
+        membershipStatus,   // ⭐ 前端使用的是这个修正后的数据
+        user: user
+          ? {
+              id: user.id || user._id,
+              openid: user.openid,
+              nickname: user.nickname,
+              avatar: user.avatar,
+              // 这里也返回修正后的状态，保持一致性
+              membership: membershipStatus?.type || user.membership,
+              membershipExpireTime: membershipStatus?.expireTime || user.membershipExpireTime
+            }
+          : null
       }
     });
   } catch (error) {

@@ -262,7 +262,54 @@ class User {
         return this;
       },
       save: async function() {
-        // SQLite 通过触发器自动更新 updatedAt
+        // SQLite 需要显式 UPDATE，不能像 Mongoose 一样自动持久化
+        const db = this.db || user.db;
+        if (!db) return this;
+
+        const toIsoOrNull = (v) => {
+          if (!v) return null;
+          if (v instanceof Date) return isNaN(v.getTime()) ? null : v.toISOString();
+          const d = new Date(v);
+          return isNaN(d.getTime()) ? null : d.toISOString();
+        };
+
+        const membershipExpireTime = toIsoOrNull(this.membershipExpireTime);
+        const activatedAt = toIsoOrNull(this.activatedAt);
+        const lastActiveTime = toIsoOrNull(this.lastActiveTime) || new Date().toISOString();
+
+        await db.run(
+          `UPDATE users SET 
+            nickname = ?, 
+            avatar = ?, 
+            membership = ?, 
+            membershipExpireTime = ?, 
+            dailyUsageDate = ?, 
+            dailyUsageTestCount = ?, 
+            totalTestCount = ?, 
+            lastActiveTime = ?, 
+            isActivated = ?, 
+            activatedAt = ?
+           WHERE id = ?`,
+          [
+            this.nickname || '',
+            this.avatar || '',
+            this.membership || 'free',
+            membershipExpireTime,
+            (this.dailyUsage && this.dailyUsage.date) ? this.dailyUsage.date : null,
+            (this.dailyUsage && typeof this.dailyUsage.testCount === 'number') ? this.dailyUsage.testCount : 0,
+            typeof this.totalTestCount === 'number' ? this.totalTestCount : 0,
+            lastActiveTime,
+            this.isActivated ? 1 : 0,
+            activatedAt,
+            this.id
+          ]
+        );
+
+        // 让内存对象保持一致
+        this.membershipExpireTime = membershipExpireTime ? new Date(membershipExpireTime) : null;
+        this.activatedAt = activatedAt ? new Date(activatedAt) : null;
+        this.lastActiveTime = lastActiveTime ? new Date(lastActiveTime) : new Date();
+
         return this;
       }
     };

@@ -81,6 +81,7 @@ app.get('/', (req, res) => {
     endpoints: {
       users: '/api/users',
       payment: '/api/payment',
+      tts: '/api/tts',
       health: '/health'
     }
   });
@@ -111,9 +112,13 @@ async function startServer() {
     const userRoutes = require('./routes/users');
     const adminRoutes = require('./routes/admin');
     const paymentRoutes = require('./routes/payment');
+    const exportRoutes = require('./routes/export');
+    const ttsRoutes = require('./routes/tts');
     app.use('/api/users', userRoutes);
     app.use('/api/admin', adminRoutes);
     app.use('/api/payment', paymentRoutes);
+    app.use('/api/export', exportRoutes);
+    app.use('/api/tts', ttsRoutes);
 
     // 路由之后注册404处理
     app.use((req, res) => {
